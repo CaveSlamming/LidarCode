@@ -1,65 +1,50 @@
-# camera_api.py
 import cv2
 import time
-from typing import Tuple, Optional
+from typing import Optional, Tuple
 
 class CameraAPI:
-    def __init__(self, left_index: Optional[int] = None, right_index: Optional[int] = None, upside_down: bool = True):
-        """
-        Initialize CameraAPI.
-
-        Args:
-            left_index: Index for the left camera (physical port).
-            right_index: Index for the right camera.
-            upside_down: If True, rotate both images 180° and swap their roles.
-        """
+    def __init__(self, left_index: int, right_index: int, upside_down: bool = True, exposure: int = -6, gain: int = 10):
         self.left_index = left_index
         self.right_index = right_index
         self.upside_down = upside_down
+        self.exposure = exposure
+        self.gain = gain
         self.left_cap: Optional[cv2.VideoCapture] = None
         self.right_cap: Optional[cv2.VideoCapture] = None
 
-    def detect_cameras(self, max_tests: int = 4) -> Tuple[int, int]:
-        found = []
-        for i in range(max_tests):
-            cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                found.append(i)
-                cap.release()
-                if len(found) >= 2:
-                    break
-        if len(found) < 2:
-            raise RuntimeError(f"Could not auto-detect two cameras (found: {found})")
-        return found[0], found[1]
-
     def connect(self) -> None:
-        if self.left_index is None or self.right_index is None:
-            self.left_index, self.right_index = self.detect_cameras()
-
         self.left_cap = cv2.VideoCapture(self.left_index)
         self.right_cap = cv2.VideoCapture(self.right_index)
-        time.sleep(0.1)  # Allow camera to warm up
+        time.sleep(0.1)
+        for cap in [self.left_cap, self.right_cap]:
+            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+            cap.set(cv2.CAP_PROP_EXPOSURE, self.exposure)
+            cap.set(cv2.CAP_PROP_GAIN, self.gain)
 
-        if not self.left_cap.isOpened() or not self.right_cap.isOpened():
-            raise RuntimeError(f"Failed to open cameras at {self.left_index}, {self.right_index}")
+    def _is_blurry(self, img, threshold=100) -> bool:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        return cv2.Laplacian(gray, cv2.CV_64F).var() < threshold
 
     def capture(self) -> Tuple:
-        if self.left_cap is None or self.right_cap is None:
-            raise RuntimeError("Cameras not connected. Call connect() first.")
+        frames = []
+        for cap in [self.left_cap, self.right_cap]:
+            best = None
+            best_score = 0
+            for _ in range(3):
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                score = cv2.Laplacian(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()
+                if score > best_score:
+                    best_score = score
+                    best = frame
+            if best is None:
+                raise RuntimeError("Failed to capture from camera")
+            frames.append(cv2.rotate(best, cv2.ROTATE_180) if self.upside_down else best)
 
-        ret_l, frame_l = self.left_cap.read()
-        ret_r, frame_r = self.right_cap.read()
-        if not ret_l or not ret_r:
-            raise RuntimeError("Failed to read from one or both cameras.")
+        return frames[1], frames[0] if self.upside_down else frames[0], frames[1]
 
-        if self.upside_down:
-            frame_l = cv2.rotate(frame_l, cv2.ROTATE_180)
-            frame_r = cv2.rotate(frame_r, cv2.ROTATE_180)
-            frame_l, frame_r = frame_r, frame_l  # Swap due to upside-down mount
-
-        return frame_l, frame_r
-
-    def release(self) -> None:
+    def disconnect(self):
         if self.left_cap:
             self.left_cap.release()
         if self.right_cap:

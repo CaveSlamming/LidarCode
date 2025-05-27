@@ -9,6 +9,7 @@ from queue import Queue
 from lidar_api import LidarAPI
 from imu_api import IMUAPI
 from camera_api import CameraAPI
+import numpy as np
 from calibration import Calibration
 import cv2
 import sys
@@ -163,7 +164,7 @@ def main():
     parser.add_argument('--imu-port', default='/dev/ttyACM0')
     parser.add_argument('--left-cam', type=int, default=2)
     parser.add_argument('--right-cam', type=int, default=0)
-    parser.add_argument('--path', default='/media/admin/Crucial X9/test_databases')
+    parser.add_argument('--path', default='data_runs')
     args = parser.parse_args()
 
     if not args.name:
@@ -179,7 +180,7 @@ def main():
 
     lidar = LidarAPI(port=args.lidar_port, baudrate=230400)
     imu = IMUAPI(port=args.imu_port, baudrate=115200)
-    camera = CameraAPI(left_index=args.left_cam, right_index=args.right_cam, upside_down=True)
+    camera = CameraAPI(left_index=args.left_cam, right_index=args.right_cam, upside_down=True, exposure=-6, gain=10)
 
     calibration = Calibration(lidar=lidar, imu=imu, duration=5.0, countdown=3)
     calib_data = calibration.run()
