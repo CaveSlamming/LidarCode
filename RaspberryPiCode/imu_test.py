@@ -2,15 +2,15 @@ import serial
 import json
 import argparse
 import sys
-import time
 
+# Corrected argument parser
 parser = argparse.ArgumentParser(description="Live IMU display")
-parser.add_argument("sensor", choices=["-acc", "-gyro", "-mag"], help="Sensor to display")
+parser.add_argument("--sensor", choices=["acc", "gyro", "mag"], required=True, help="Sensor to display (acc, gyro, or mag)")
 parser.add_argument("--port", default="/dev/ttyACM0", help="Serial port (default: /dev/ttyACM0)")
 parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default: 115200)")
 args = parser.parse_args()
 
-sensor_key = args.sensor.lstrip("-")
+sensor_key = args.sensor.lower()
 
 try:
     ser = serial.Serial(args.port, args.baud, timeout=1)
