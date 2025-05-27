@@ -164,7 +164,7 @@ def main():
     parser.add_argument('--imu-port', default='/dev/ttyACM0')
     parser.add_argument('--left-cam', type=int, default=2)
     parser.add_argument('--right-cam', type=int, default=0)
-    parser.add_argument('--path', default='data_runs')
+    parser.add_argument('--path', default='/media/admin/Crucial X9/test_databases')
     args = parser.parse_args()
 
     if not args.name:
