@@ -11,11 +11,12 @@ from imu_api import IMUAPI
 from camera_api import CameraAPI
 from calibration import Calibration
 import cv2
+import sys
+import select
 
 def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     cursor = conn.cursor()
-
     cursor.executescript("""
     PRAGMA journal_mode=WAL;
 
@@ -112,58 +113,44 @@ def init_db(db_path: str) -> sqlite3.Connection:
     conn.commit()
     return conn
 
-
-def write_run_metadata(conn: sqlite3.Connection, name: str, description: str, run_type: str) -> int:
-    start_ns = time.time_ns()
+def write_run_metadata(conn, name, desc, run_type):
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO run_metadata (name, description, type, start_time_ns) VALUES (?, ?, ?, ?)",
-        (name, description, run_type, start_ns)
-    )
+    cur.execute("INSERT INTO run_metadata (name, description, type, start_time_ns) VALUES (?, ?, ?, ?)",
+                (name, desc, run_type, time.time_ns()))
     conn.commit()
     return cur.lastrowid
 
-def update_run_end(conn: sqlite3.Connection, run_id: int) -> None:
-    end_ns = time.time_ns()
-    conn.execute(
-        "UPDATE run_metadata SET end_time_ns = ? WHERE id = ?",
-        (end_ns, run_id)
-    )
+def update_run_end(conn, run_id):
+    conn.execute("UPDATE run_metadata SET end_time_ns = ? WHERE id = ?", (time.time_ns(), run_id))
     conn.commit()
 
-def write_calibration(conn: sqlite3.Connection, run_id: int, calib_data: dict):
+def write_calibration(conn, run_id, calib_data):
     cur = conn.cursor()
     for step_name, samples in calib_data.items():
         start_ns = samples[0]['pi_timestamp_ns']
         end_ns = samples[-1]['pi_timestamp_ns']
-        cur.execute(
-            "INSERT INTO calibration_steps (run_id, step_name, instruction, start_time_ns, end_time_ns) VALUES (?, ?, ?, ?, ?)",
-            (run_id, step_name, step_name, start_ns, end_ns)
-        )
+        cur.execute("INSERT INTO calibration_steps (run_id, step_name, instruction, start_time_ns, end_time_ns) VALUES (?, ?, ?, ?, ?)",
+                    (run_id, step_name, step_name, start_ns, end_ns))
         step_id = cur.lastrowid
-
         for sample in samples:
             ts = sample['pi_timestamp_ns']
             if sample.get('imu'):
                 imu = sample['imu']
-                cur.execute(
-                    "INSERT INTO calibration_imu_data (step_id, pi_timestamp_ns, arduino_timestamp_s, acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z, mag_x, mag_y, mag_z)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (step_id, ts, imu['t'], *imu['acc'], *imu['gyro'], *(imu.get('mag', [None, None, None])))
-                )
+                cur.execute("""
+                    INSERT INTO calibration_imu_data (step_id, pi_timestamp_ns, arduino_timestamp_s,
+                    acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z, mag_x, mag_y, mag_z)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (step_id, ts, imu['t'], *imu['acc'], *imu['gyro'], *(imu.get('mag', [None, None, None]))))
             if sample.get('lidar'):
                 lidar = sample['lidar']
-                cur.execute(
-                    "INSERT INTO calibration_lidar_data (step_id, pi_timestamp_ns, lidar_timestamp_s, speed, start_angle, end_angle)"
-                    " VALUES (?, ?, ?, ?, ?, ?)",
-                    (step_id, ts, lidar['sensor_timestamp'], lidar['speed'], lidar['start_angle'], lidar['end_angle'])
-                )
+                cur.execute("""
+                    INSERT INTO calibration_lidar_data (step_id, pi_timestamp_ns, lidar_timestamp_s, speed, start_angle, end_angle)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (step_id, ts, lidar['sensor_timestamp'], lidar['speed'], lidar['start_angle'], lidar['end_angle']))
                 scan_id = cur.lastrowid
                 for pt in lidar['points']:
-                    cur.execute(
-                        "INSERT INTO calibration_lidar_points (scan_id, angle, distance, intensity) VALUES (?, ?, ?, ?)",
-                        (scan_id, pt['angle'], pt['distance'], pt['intensity'])
-                    )
+                    cur.execute("INSERT INTO calibration_lidar_points (scan_id, angle, distance, intensity) VALUES (?, ?, ?, ?)",
+                                (scan_id, pt['angle'], pt['distance'], pt['intensity']))
     conn.commit()
 
 def main():
@@ -176,7 +163,7 @@ def main():
     parser.add_argument('--imu-port', default='/dev/ttyACM0')
     parser.add_argument('--left-cam', type=int, default=2)
     parser.add_argument('--right-cam', type=int, default=0)
-    parser.add_argument('--path', default='/media/admin/Crucial X9/test_databases')
+    parser.add_argument('--path', default='data_runs')
     args = parser.parse_args()
 
     if not args.name:
@@ -233,10 +220,8 @@ def main():
                 """, (scan_run_id, pi_ts, data['sensor_timestamp'], data['speed'], data['start_angle'], data['end_angle']))
                 scan_id = cur.lastrowid
                 for pt in data['points']:
-                    cur.execute("""
-                        INSERT INTO lidar_points (scan_id, angle, distance, intensity)
-                        VALUES (?, ?, ?, ?)
-                    """, (scan_id, pt['angle'], pt['distance'], pt['intensity']))
+                    cur.execute("INSERT INTO lidar_points (scan_id, angle, distance, intensity) VALUES (?, ?, ?, ?)",
+                                (scan_id, pt['angle'], pt['distance'], pt['intensity']))
                 conn.commit()
             except:
                 continue
@@ -250,15 +235,13 @@ def main():
                 right_path = os.path.join(image_dir, f"{pi_ts}_right.jpg")
                 cv2.imwrite(left_path, left_img)
                 cv2.imwrite(right_path, right_img)
-                conn.execute("""
-                    INSERT INTO stereo_images (run_id, pi_timestamp_ns, left_image_path, right_image_path)
-                    VALUES (?, ?, ?, ?)
-                """, (scan_run_id, pi_ts, left_path, right_path))
+                conn.execute("INSERT INTO stereo_images (run_id, pi_timestamp_ns, left_image_path, right_image_path) VALUES (?, ?, ?, ?)",
+                             (scan_run_id, pi_ts, left_path, right_path))
                 conn.commit()
             except:
                 continue
 
-    print("Recording scan data. Press ENTER to stop.")
+    print("Recording scan data. Press ENTER to stop...")
     threads = [
         threading.Thread(target=imu_writer),
         threading.Thread(target=lidar_writer),
@@ -268,7 +251,7 @@ def main():
         t.start()
 
     try:
-        while True:
+        while not stop_flag[0]:
             pi_ts = time.time_ns()
             if (pkt := lidar.get_latest_packet()):
                 lidar_q.put((pi_ts, pkt[1]))
@@ -279,12 +262,13 @@ def main():
                 cam_q.put((pi_ts, left_img, right_img))
             except:
                 pass
+            if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+                _ = sys.stdin.readline()
+                stop_flag[0] = True
             time.sleep(0.01)
     except KeyboardInterrupt:
-        pass
+        stop_flag[0] = True
 
-    input()
-    stop_flag[0] = True
     for t in threads:
         t.join()
 
