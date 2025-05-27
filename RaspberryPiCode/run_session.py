@@ -14,7 +14,104 @@ import cv2
 
 def init_db(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
+    cursor = conn.cursor()
+
+    cursor.executescript("""
+    PRAGMA journal_mode=WAL;
+
+    CREATE TABLE IF NOT EXISTS run_metadata (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        description TEXT,
+        type TEXT CHECK(type IN ('calibration', 'scan')),
+        start_time_ns BIGINT,
+        end_time_ns BIGINT
+    );
+
+    CREATE TABLE IF NOT EXISTS calibration_steps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER,
+        step_name TEXT,
+        instruction TEXT,
+        start_time_ns BIGINT,
+        end_time_ns BIGINT,
+        FOREIGN KEY(run_id) REFERENCES run_metadata(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS calibration_imu_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        step_id INTEGER,
+        pi_timestamp_ns BIGINT NOT NULL,
+        arduino_timestamp_s REAL NOT NULL,
+        acc_x REAL, acc_y REAL, acc_z REAL,
+        gyro_x REAL, gyro_y REAL, gyro_z REAL,
+        mag_x REAL, mag_y REAL, mag_z REAL,
+        FOREIGN KEY(step_id) REFERENCES calibration_steps(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS calibration_lidar_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        step_id INTEGER,
+        pi_timestamp_ns BIGINT NOT NULL,
+        lidar_timestamp_s REAL,
+        speed REAL,
+        start_angle REAL,
+        end_angle REAL,
+        FOREIGN KEY(step_id) REFERENCES calibration_steps(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS calibration_lidar_points (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scan_id INTEGER,
+        angle REAL,
+        distance REAL,
+        intensity INTEGER,
+        FOREIGN KEY(scan_id) REFERENCES calibration_lidar_data(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS imu_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER,
+        pi_timestamp_ns BIGINT NOT NULL,
+        arduino_timestamp_s REAL NOT NULL,
+        acc_x REAL, acc_y REAL, acc_z REAL,
+        gyro_x REAL, gyro_y REAL, gyro_z REAL,
+        mag_x REAL, mag_y REAL, mag_z REAL,
+        FOREIGN KEY(run_id) REFERENCES run_metadata(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS lidar_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER,
+        pi_timestamp_ns BIGINT NOT NULL,
+        lidar_timestamp_s REAL,
+        speed REAL,
+        start_angle REAL,
+        end_angle REAL,
+        FOREIGN KEY(run_id) REFERENCES run_metadata(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS lidar_points (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scan_id INTEGER,
+        angle REAL,
+        distance REAL,
+        intensity INTEGER,
+        FOREIGN KEY(scan_id) REFERENCES lidar_data(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS stereo_images (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER,
+        pi_timestamp_ns BIGINT NOT NULL,
+        left_image_path TEXT,
+        right_image_path TEXT,
+        FOREIGN KEY(run_id) REFERENCES run_metadata(id)
+    );
+    """)
+    conn.commit()
     return conn
+
 
 def write_run_metadata(conn: sqlite3.Connection, name: str, description: str, run_type: str) -> int:
     start_ns = time.time_ns()
