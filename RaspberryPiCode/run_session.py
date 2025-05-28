@@ -20,7 +20,6 @@ def init_db(db_path: str) -> sqlite3.Connection:
     cursor = conn.cursor()
     cursor.executescript("""
     PRAGMA journal_mode=WAL;
-    PRAGMA synchronous=NORMAL;
 
     CREATE TABLE IF NOT EXISTS run_metadata (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -155,81 +154,6 @@ def write_calibration(conn, run_id, calib_data):
                                 (scan_id, pt['angle'], pt['distance'], pt['intensity']))
     conn.commit()
 
-class ThreadSafeDBWriter:
-    """Thread-safe database writer with connection pooling"""
-    def __init__(self, db_path: str, run_id: int):
-        self.db_path = db_path
-        self.run_id = run_id
-        self.local = threading.local()
-        self.lock = threading.Lock()
-        
-    def get_connection(self):
-        """Get a thread-local database connection"""
-        if not hasattr(self.local, 'conn'):
-            self.local.conn = sqlite3.connect(self.db_path)
-            self.local.conn.execute("PRAGMA journal_mode=WAL")
-            self.local.conn.execute("PRAGMA synchronous=NORMAL")
-        return self.local.conn
-    
-    def write_imu(self, pi_ts: int, imu_data: dict):
-        """Write IMU data atomically"""
-        conn = self.get_connection()
-        try:
-            conn.execute("""
-                INSERT INTO imu_data (run_id, pi_timestamp_ns, arduino_timestamp_s,
-                    acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z, mag_x, mag_y, mag_z)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (self.run_id, pi_ts, imu_data['t'], 
-                  *imu_data['acc'], *imu_data['gyro'], 
-                  *(imu_data.get('mag', [None, None, None]))))
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            print(f"Error writing IMU data: {e}")
-    
-    def write_lidar(self, pi_ts: int, data: dict):
-        """Write LiDAR data and points atomically"""
-        conn = self.get_connection()
-        try:
-            # Use a transaction to ensure atomicity
-            with conn:
-                cur = conn.cursor()
-                cur.execute("""
-                    INSERT INTO lidar_data (run_id, pi_timestamp_ns, lidar_timestamp_s, speed, start_angle, end_angle)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (self.run_id, pi_ts, data['sensor_timestamp'], 
-                      data['speed'], data['start_angle'], data['end_angle']))
-                
-                scan_id = cur.lastrowid
-                
-                # Insert all points for this scan atomically
-                point_data = [(scan_id, pt['angle'], pt['distance'], pt['intensity']) 
-                             for pt in data['points']]
-                cur.executemany(
-                    "INSERT INTO lidar_points (scan_id, angle, distance, intensity) VALUES (?, ?, ?, ?)",
-                    point_data
-                )
-        except Exception as e:
-            print(f"Error writing LiDAR data: {e}")
-    
-    def write_stereo_image(self, pi_ts: int, left_path: str, right_path: str):
-        """Write stereo image paths atomically"""
-        conn = self.get_connection()
-        try:
-            conn.execute("""
-                INSERT INTO stereo_images (run_id, pi_timestamp_ns, left_image_path, right_image_path) 
-                VALUES (?, ?, ?, ?)
-            """, (self.run_id, pi_ts, left_path, right_path))
-            conn.commit()
-        except Exception as e:
-            conn.rollback()
-            print(f"Error writing image data: {e}")
-    
-    def close_all(self):
-        """Close the thread-local connection if it exists"""
-        if hasattr(self.local, 'conn'):
-            self.local.conn.close()
-
 def main():
     import argparse
     parser = argparse.ArgumentParser()
@@ -251,138 +175,106 @@ def main():
     db_path = os.path.join(session_path, args.db)
     image_dir = os.path.join(session_path, "images")
 
-    # Initialize main connection for metadata
     conn = init_db(db_path)
     run_id = write_run_metadata(conn, args.name, args.desc, 'calibration')
 
-    # Initialize sensors
     lidar = LidarAPI(port=args.lidar_port, baudrate=230400)
     imu = IMUAPI(port=args.imu_port, baudrate=115200)
-    camera = CameraAPI(left_index=args.left_cam, right_index=args.right_cam, 
-                      upside_down=True, exposure=-6, gain=10)
+    camera = CameraAPI(left_index=args.left_cam, right_index=args.right_cam, upside_down=True, exposure=-6, gain=10)
 
-    # Run calibration
     calibration = Calibration(lidar=lidar, imu=imu, duration=5.0, countdown=3)
     calib_data = calibration.run()
     write_calibration(conn, run_id, calib_data)
     update_run_end(conn, run_id)
 
-    # Start scan session
     scan_run_id = write_run_metadata(conn, args.name + ":scan", args.desc, 'scan')
-    
-    # Create thread-safe writer
-    db_writer = ThreadSafeDBWriter(db_path, scan_run_id)
-    
-    # Connect sensors
     lidar.connect()
     imu.connect()
     camera.connect()
 
-    # Create queues for data
     imu_q = Queue()
     lidar_q = Queue()
     cam_q = Queue()
-    stop_flag = threading.Event()
+    stop_flag = [False]
 
     def imu_writer():
-        """IMU writer thread"""
-        while not stop_flag.is_set() or not imu_q.empty():
+        while not stop_flag[0] or not imu_q.empty():
             try:
                 pi_ts, imu_data = imu_q.get(timeout=0.1)
-                db_writer.write_imu(pi_ts, imu_data)
-                imu_q.task_done()
+                conn.execute("""
+                    INSERT INTO imu_data (run_id, pi_timestamp_ns, arduino_timestamp_s,
+                        acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z, mag_x, mag_y, mag_z)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (scan_run_id, pi_ts, imu_data['t'], *imu_data['acc'], *imu_data['gyro'], *(imu_data.get('mag', [None, None, None]))))
+                conn.commit()
             except:
                 continue
-        db_writer.close_all()
 
     def lidar_writer():
-        """LiDAR writer thread"""
-        while not stop_flag.is_set() or not lidar_q.empty():
+        while not stop_flag[0] or not lidar_q.empty():
             try:
                 pi_ts, data = lidar_q.get(timeout=0.1)
-                db_writer.write_lidar(pi_ts, data)
-                lidar_q.task_done()
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO lidar_data (run_id, pi_timestamp_ns, lidar_timestamp_s, speed, start_angle, end_angle)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, (scan_run_id, pi_ts, data['sensor_timestamp'], data['speed'], data['start_angle'], data['end_angle']))
+                scan_id = cur.lastrowid
+                for pt in data['points']:
+                    cur.execute("INSERT INTO lidar_points (scan_id, angle, distance, intensity) VALUES (?, ?, ?, ?)",
+                                (scan_id, pt['angle'], pt['distance'], pt['intensity']))
+                conn.commit()
             except:
                 continue
-        db_writer.close_all()
 
     def camera_writer():
-        """Camera writer thread"""
         os.makedirs(image_dir, exist_ok=True)
-        while not stop_flag.is_set() or not cam_q.empty():
+        while not stop_flag[0] or not cam_q.empty():
             try:
                 pi_ts, left_img, right_img = cam_q.get(timeout=0.1)
                 left_path = os.path.join(image_dir, f"{pi_ts}_left.jpg")
                 right_path = os.path.join(image_dir, f"{pi_ts}_right.jpg")
                 cv2.imwrite(left_path, left_img)
                 cv2.imwrite(right_path, right_img)
-                db_writer.write_stereo_image(pi_ts, left_path, right_path)
-                cam_q.task_done()
+                conn.execute("INSERT INTO stereo_images (run_id, pi_timestamp_ns, left_image_path, right_image_path) VALUES (?, ?, ?, ?)",
+                             (scan_run_id, pi_ts, left_path, right_path))
+                conn.commit()
             except:
                 continue
-        db_writer.close_all()
 
     print("Recording scan data. Press ENTER to stop...")
-    
-    # Start writer threads
     threads = [
-        threading.Thread(target=imu_writer, name="IMU-Writer"),
-        threading.Thread(target=lidar_writer, name="LiDAR-Writer"),
-        threading.Thread(target=camera_writer, name="Camera-Writer")
+        threading.Thread(target=imu_writer),
+        threading.Thread(target=lidar_writer),
+        threading.Thread(target=camera_writer)
     ]
     for t in threads:
         t.start()
 
-    # Data collection loop
     try:
-        while not stop_flag.is_set():
-            # Get LiDAR data with its original timestamp
-            lidar_packet = lidar.get_latest_packet()
-            if lidar_packet:
-                pi_ts, lidar_data = lidar_packet
-                lidar_q.put((pi_ts, lidar_data))
-            
-            # Get IMU data
-            imu_data = imu.get_latest_packet()
-            if imu_data:
-                pi_ts = time.time_ns()
-                imu_q.put((pi_ts, imu_data))
-            
-            # Get camera data
+        while not stop_flag[0]:
+            pi_ts = time.time_ns()
+            if (pkt := lidar.get_latest_packet()):
+                lidar_q.put((pi_ts, pkt[1]))
+            if (pkt := imu.get_latest_packet()):
+                imu_q.put((pi_ts, pkt))
             try:
                 left_img, right_img = camera.capture()
-                pi_ts = time.time_ns()
                 cam_q.put((pi_ts, left_img, right_img))
-            except Exception as e:
-                # Camera capture can fail occasionally
+            except:
                 pass
-            
-            # Check for user input (non-blocking)
             if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
                 _ = sys.stdin.readline()
-                stop_flag.set()
-            
-            time.sleep(0.01)  # Small delay to prevent CPU spinning
-            
+                stop_flag[0] = True
+            time.sleep(0.01)
     except KeyboardInterrupt:
-        print("\nInterrupted by user")
-        stop_flag.set()
+        stop_flag[0] = True
 
-    # Wait for threads to finish
-    print("Waiting for writers to finish...")
     for t in threads:
-        t.join(timeout=5.0)
-        if t.is_alive():
-            print(f"Warning: {t.name} thread did not finish cleanly")
+        t.join()
 
-    # Finalize
-    lidar.disconnect()
-    imu.disconnect()
-    camera.disconnect()
-    
     update_run_end(conn, scan_run_id)
     conn.close()
-    
     print(f"Session '{args.name}' complete. Data saved to '{session_path}'")
 
 if __name__ == '__main__':
